@@ -1,30 +1,44 @@
 """
-GraphStrider: a Text-to-SPARQL retrieval pipeline (v2).
+GraphStrider: a data-agnostic, plan-and-retrieve KGQA pipeline (v3).
 
-Changes vs v1
--------------
-* No brackets needed. The LLM infers the entity itself and writes it as ex:entity_name.
-* Safety net for the "LLM guessed the wrong name" problem: after generation, every ex:<entity>
-  in the SPARQL is verified against the KB. Case problems are fixed and near-misses
-  (ex:chris_nolan -> ex:christopher_nolan) are repaired by fuzzy matching. Unresolvable
-  entities are flagged in the logs.
-* Every stage (sparql_generation, entity_resolution, db_execution, nl_generation) is timed and
-  its tokens/cost recorded per question; each run folder gets a summary with a bottleneck diagnosis.
+How a question is answered
+--------------------------
+1. planning (1 LLM call, RoG-style "Reasoning on Graphs"):
+   The LLM never writes SPARQL and never walks the graph. Given the relation schema that was
+   extracted automatically from the KB, it returns a small JSON *relation-path blueprint*:
+       {"plans": [{"constraints": [{"entity": "Joel Zwick", "path": ["~directed_by", "in_language"]}]}]}
+   `rel` walks subject -> object, `~rel` walks object -> subject. Several constraints in one plan are
+   intersected; alternative plans are only tried if earlier ones return nothing.
+2. entity_linking (0 LLM calls, BLINK-style bi-encoder):
+   Every node label in the KB is embedded once (cached on disk) into a FAISS inner-product index.
+   Each entity mention from the plan is embedded and linked by nearest-neighbour search
+   (exact label matches are tried first). The top-k candidates are kept; the relation path picks the
+   first candidate the path actually works for, so the plan also disambiguates the entity.
+3. path_execution (deterministic): each constraint becomes one SPARQL property-path query
+   (`VALUES ?topic { <e> } ?topic ^<p1>/<p2> ?answer`), run by pyoxigraph.
+4. replanning (optional, 1 LLM call, only if every plan came back empty): the LLM gets feedback
+   (where each path broke, which relations the linked entity really has) and proposes new plans.
+5. nl_generation (optional, --with-nl / ad-hoc questions).
+
+Nothing in this file is specific to MetaQA or to movies: namespaces, labels (rdfs:label, skos:prefLabel,
+schema:name, ... or the IRI local name), relations and the few-shot examples are all discovered from the KB.
+
+Web UI: `uv run streamlit run app.py` (see README.md and docs/IMPLEMENTATION.md).
 
 Run folder:  outputs/run_<YYYYmmdd_HHMMSS>/
     run_config.json        config (key redacted), argv, versions, startup timings
-    prompt_sparql.txt      exact system prompt sent for SPARQL generation
+    prompt_plan.txt        exact system prompt sent for planning
     prompt_answer.txt      exact system prompt sent for NL answers
-    details.jsonl          one line per question: question, SPARQL, raw LLM output, entities, answers, metrics
-    timings.csv            one row per question: per-stage seconds / tokens / cost (open in Excel/pandas)
+    details.jsonl          one line per question: question, plans, linked entities, SPARQL, answers, metrics
+    timings.csv            one row per question: per-stage seconds / tokens / cost
     queries.log            human-readable log of each question
     errors.log             full tracebacks
-    summary.json           aggregated stats per stage + slowest questions + diagnosis
-    summary.txt            same, human readable
+    summary.json / .txt    aggregated stats per stage + slowest questions + diagnosis
 
-Env vars (in .env): KB_PATH, QA_PATH, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, MAX_QUESTIONS,
-    SCHEMA_CACHE_PATH, LLM_PRICE_INPUT_PER_1M, LLM_PRICE_OUTPUT_PER_1M (USD, default 0 = local model),
-    LLM_MAX_TOKENS (optional), FUZZY_CUTOFF (default 0.82)
+Env vars (in .env): KB_PATH, QA_PATH, LLM_BASE_URL, LLM_API_KEY, LLM_MODEL, MAX_QUESTIONS, LLM_MAX_TOKENS,
+    LLM_PRICE_INPUT_PER_1M, LLM_PRICE_OUTPUT_PER_1M (USD, default 0 = local model),
+    CACHE_DIR (default .cache), EMBED_BACKEND (fastembed | openai), EMBED_MODEL, EMBED_BASE_URL, EMBED_API_KEY,
+    LINK_TOP_K (default 5), LINK_MIN_SCORE (default 0.75), MAX_PLANS (default 3), REPLAN_ROUNDS (default 1)
 """
 
 from __future__ import annotations
@@ -32,6 +46,7 @@ from __future__ import annotations
 import argparse
 import csv
 import difflib
+import hashlib
 import json
 import os
 import platform
@@ -43,28 +58,36 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Iterable, Iterator
+from typing import Callable, Iterable, Iterator
+from urllib.parse import unquote
 
+import faiss
+import numpy as np
 import pyoxigraph as ox
 from dotenv import load_dotenv
 from openai import OpenAI
 from tqdm import tqdm
 
-try:  # optional, much faster fuzzy matching
-    from rapidfuzz import fuzz as _rf_fuzz, process as _rf_process
-except ImportError:  # pragma: no cover
-    _rf_fuzz = _rf_process = None
-
 # --------------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------------- #
 
-EX_PREFIX = "http://example.org/"
-SPARQL_PREFIX_HEADER = "PREFIX ex: <http://example.org/>\n"
+CACHE_VERSION = 3
+STAGES = ("planning", "entity_linking", "path_execution", "replanning", "nl_generation")
 BRACKET_CHARS = re.compile(r"[\[\]]")
-EX_REF = re.compile(r"\bex:([^\s{}<>;,()]+)")
-SCHEMA_VERSION = 2
-STAGES = ("sparql_generation", "entity_resolution", "db_execution", "nl_generation")
+
+# Predicates whose objects are human-readable names for their subjects (used for linking, not for planning).
+LABEL_PREDICATES = (
+    "http://www.w3.org/2000/01/rdf-schema#label",
+    "http://www.w3.org/2004/02/skos/core#prefLabel",
+    "http://www.w3.org/2004/02/skos/core#altLabel",
+    "http://schema.org/name",
+    "https://schema.org/name",
+    "http://xmlns.com/foaf/0.1/name",
+    "http://purl.org/dc/terms/title",
+    "http://purl.org/dc/elements/1.1/title",
+)
+MAX_LITERAL_LABEL_CHARS = 64  # longer literals (descriptions, abstracts) are not linkable entities
 
 
 @dataclass
@@ -75,11 +98,19 @@ class Config:
     llm_api_key: str
     llm_model: str
     max_questions: int | None = None
-    schema_cache_path: Path = Path("schema_cache.json")
+    cache_dir: Path = Path(".cache")
     price_in_per_1m: float = 0.0
     price_out_per_1m: float = 0.0
     max_tokens: int | None = None
-    fuzzy_cutoff: float = 0.82
+    embed_backend: str = "fastembed"
+    embed_model: str = "BAAI/bge-small-en-v1.5"
+    embed_base_url: str = ""
+    embed_api_key: str = ""
+    link_top_k: int = 5
+    link_min_score: float = 0.75
+    max_plans: int = 3
+    max_hops: int = 4
+    replan_rounds: int = 1
 
 
 def _env_float(name: str, default: float) -> float:
@@ -89,22 +120,37 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.getenv(name, "").strip()
+    return int(raw) if raw.isdigit() else default
+
+
 def load_config() -> Config:
     load_dotenv()
     max_q_raw = os.getenv("MAX_QUESTIONS", "").strip()
     max_tok_raw = os.getenv("LLM_MAX_TOKENS", "").strip()
+    base_url = os.getenv("LLM_BASE_URL", "http://localhost:1234/v1")
+    api_key = os.getenv("LLM_API_KEY", "lm-studio")
     return Config(
         kb_path=Path(os.getenv("KB_PATH", "kb.ttl")),
         qa_path=Path(os.getenv("QA_PATH", "MetaQA/1-hop/ntm/qa_dev.txt")),
-        llm_base_url=os.getenv("LLM_BASE_URL", "http://localhost:1234/v1"),
-        llm_api_key=os.getenv("LLM_API_KEY", "lm-studio"),
+        llm_base_url=base_url,
+        llm_api_key=api_key,
         llm_model=os.getenv("LLM_MODEL", "local-model"),
         max_questions=int(max_q_raw) if max_q_raw.isdigit() else None,
-        schema_cache_path=Path(os.getenv("SCHEMA_CACHE_PATH", "schema_cache.json")),
+        cache_dir=Path(os.getenv("CACHE_DIR", ".cache")),
         price_in_per_1m=_env_float("LLM_PRICE_INPUT_PER_1M", 0.0),
         price_out_per_1m=_env_float("LLM_PRICE_OUTPUT_PER_1M", 0.0),
         max_tokens=int(max_tok_raw) if max_tok_raw.isdigit() else None,
-        fuzzy_cutoff=_env_float("FUZZY_CUTOFF", 0.82),
+        embed_backend=os.getenv("EMBED_BACKEND", "fastembed").strip().lower(),
+        embed_model=os.getenv("EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+        embed_base_url=os.getenv("EMBED_BASE_URL", base_url),
+        embed_api_key=os.getenv("EMBED_API_KEY", api_key),
+        link_top_k=_env_int("LINK_TOP_K", 5),
+        link_min_score=_env_float("LINK_MIN_SCORE", 0.75),
+        max_plans=_env_int("MAX_PLANS", 3),
+        max_hops=_env_int("MAX_HOPS", 4),
+        replan_rounds=_env_int("REPLAN_ROUNDS", 1),
     )
 
 
@@ -179,6 +225,9 @@ class Trace:
 # --------------------------------------------------------------------------- #
 
 INVALID_PERCENT_ENCODING = re.compile(rb"%(?![0-9A-Fa-f]{2})")
+RDF_FORMATS = {".ttl": ox.RdfFormat.TURTLE, ".nt": ox.RdfFormat.N_TRIPLES, ".nq": ox.RdfFormat.N_QUADS,
+               ".trig": ox.RdfFormat.TRIG, ".rdf": ox.RdfFormat.RDF_XML, ".xml": ox.RdfFormat.RDF_XML,
+               ".n3": ox.RdfFormat.N3}
 
 
 def build_store(kb_path: Path) -> ox.Store:
@@ -187,7 +236,8 @@ def build_store(kb_path: Path) -> ox.Store:
     store = ox.Store()
     print(f"Loading knowledge base from {kb_path} ...")
     raw = INVALID_PERCENT_ENCODING.sub(b"%25", kb_path.read_bytes())
-    store.load(raw, format=ox.RdfFormat.TURTLE, base_iri=EX_PREFIX)
+    fmt = RDF_FORMATS.get(kb_path.suffix.lower(), ox.RdfFormat.TURTLE)
+    store.load(raw, format=fmt, base_iri=kb_path.resolve().as_uri())
     print("Knowledge base loaded.")
     return store
 
@@ -196,13 +246,16 @@ def build_llm_client(cfg: Config) -> OpenAI:
     return OpenAI(base_url=cfg.llm_base_url, api_key=cfg.llm_api_key)
 
 
+THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+
+
 def chat(client: OpenAI, cfg: Config, messages: list[dict], temperature: float) -> LLMCall:
     kwargs = {"max_tokens": cfg.max_tokens} if cfg.max_tokens else {}
     t0 = time.perf_counter()
     resp = client.chat.completions.create(model=cfg.llm_model, messages=messages,
                                           temperature=temperature, **kwargs)
     seconds = time.perf_counter() - t0
-    text = resp.choices[0].message.content or ""
+    text = THINK_BLOCK.sub("", resp.choices[0].message.content or "").strip()
     usage = resp.usage
     if usage and usage.total_tokens:
         return LLMCall(text, seconds, usage.prompt_tokens, usage.completion_tokens, False)
@@ -211,78 +264,512 @@ def chat(client: OpenAI, cfg: Config, messages: list[dict], temperature: float) 
 
 
 # --------------------------------------------------------------------------- #
-# Entity helpers
+# KB introspection: relations, labels, linkable nodes (no dataset assumptions)
 # --------------------------------------------------------------------------- #
 
-def entity_to_uri_local_name(entity: str) -> str:
-    return entity.strip().lower().replace(" ", "_")
+def iri_local_name(iri: str) -> str:
+    tail = re.split(r"[#/:]", iri.rstrip("/#"))[-1]
+    return unquote(tail) or iri
 
 
-def entity_exists(store: ox.Store, local_name: str) -> bool:
-    try:
-        uri = ox.NamedNode(EX_PREFIX + local_name).value
-        return bool(store.query("ASK { <%s> ?p ?o }" % uri)) or bool(store.query("ASK { ?s ?p <%s> }" % uri))
-    except Exception:
-        return False
+def humanize(name: str) -> str:
+    name = re.sub(r"(?<=[a-z0-9])(?=[A-Z])", " ", name)  # camelCase -> camel Case
+    return re.sub(r"\s+", " ", name.replace("_", " ")).strip()
 
 
-class EntityIndex:
-    """All entity local names in the KB, used to repair names the LLM got slightly wrong."""
+def normalize_label(text: str) -> str:
+    return re.sub(r"\s+", " ", text.replace("_", " ")).strip().lower()
 
-    def __init__(self, store: ox.Store, predicate_set: set[str], cutoff: float):
-        self.store, self.cutoff = store, cutoff
+
+def term_key(term) -> str:
+    """SPARQL/N-Triples serialization of a term; usable verbatim inside a query."""
+    return str(term)
+
+
+@dataclass
+class Relation:
+    name: str          # short name shown to the LLM (unique)
+    iri: str
+    count: int = 0
+    literal_objects: int = 0
+    datatypes: set[str] = field(default_factory=set)
+    samples: list[tuple[str, str]] = field(default_factory=list)  # (subject key, object key)
+
+    @property
+    def object_kind(self) -> str:
+        if self.literal_objects == 0:
+            return "entity"
+        if self.literal_objects == self.count:
+            dts = ", ".join(sorted(iri_local_name(d) for d in self.datatypes)) or "string"
+            return f"literal ({dts})"
+        return "entity or literal"
+
+
+@dataclass
+class KBGraph:
+    relations: dict[str, Relation]         # by short name
+    by_iri: dict[str, Relation]
+    labels: dict[str, str]                 # term key -> display label
+    nodes: list[str]                       # linkable term keys
+    signature: str
+
+    def label(self, key: str) -> str:
+        if key in self.labels:
+            return self.labels[key]
+        if key.startswith("<") and key.endswith(">"):
+            return humanize(iri_local_name(key[1:-1]))
+        return key
+
+
+def introspect_kb(store: ox.Store, kb_path: Path, samples_per_relation: int = 25) -> KBGraph:
+    stat = kb_path.stat()
+    signature = f"v{CACHE_VERSION}:{kb_path.resolve()}:{stat.st_size}:{int(stat.st_mtime)}"
+    rels: dict[str, Relation] = {}
+    explicit_labels: dict[str, str] = {}
+    literal_labels: dict[str, str] = {}
+    nodes: dict[str, None] = {}
+    label_preds = set(LABEL_PREDICATES)
+
+    for quad in store.quads_for_pattern(None, None, None, None):
+        s, p, o = quad.subject, quad.predicate, quad.object
+        if not isinstance(s, ox.NamedNode):
+            continue
+        s_key = term_key(s)
+        if p.value in label_preds:
+            if isinstance(o, ox.Literal) and (o.language in (None, "", "en") or s_key not in explicit_labels):
+                explicit_labels[s_key] = o.value
+            nodes[s_key] = None
+            continue
+        rel = rels.get(p.value)
+        if rel is None:
+            rel = rels[p.value] = Relation(name="", iri=p.value)
+        rel.count += 1
+        nodes[s_key] = None
+        if isinstance(o, ox.Literal):
+            rel.literal_objects += 1
+            rel.datatypes.add(o.datatype.value)
+            if len(o.value) > MAX_LITERAL_LABEL_CHARS:
+                continue
+        elif not isinstance(o, ox.NamedNode):
+            continue
+        o_key = term_key(o)
+        nodes[o_key] = None
+        if isinstance(o, ox.Literal):
+            literal_labels[o_key] = o.value
+        if len(rel.samples) < samples_per_relation:
+            rel.samples.append((s_key, o_key))
+
+    # Unique, readable short names for relations: local name, disambiguated on collision.
+    seen: dict[str, int] = {}
+    for rel in sorted(rels.values(), key=lambda r: r.iri):
+        base = re.sub(r"[^\w\-.]", "_", iri_local_name(rel.iri)) or "rel"
+        seen[base] = seen.get(base, 0) + 1
+        rel.name = base if seen[base] == 1 else f"{base}_{seen[base]}"
+
+    labels = {**literal_labels, **explicit_labels}
+    graph = KBGraph({r.name: r for r in rels.values()}, rels, labels, list(nodes), signature)
+    for key in graph.nodes:
+        labels.setdefault(key, graph.label(key))
+    return graph
+
+
+# --------------------------------------------------------------------------- #
+# BLINK-style bi-encoder entity linking (FAISS nearest neighbour over label embeddings)
+# --------------------------------------------------------------------------- #
+
+class Embedder:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.name = f"{cfg.embed_backend}:{cfg.embed_model}"
+        if cfg.embed_backend == "fastembed":
+            from fastembed import TextEmbedding
+            self._model = TextEmbedding(cfg.embed_model)
+        elif cfg.embed_backend == "openai":
+            self._client = OpenAI(base_url=cfg.embed_base_url, api_key=cfg.embed_api_key)
+        else:
+            raise ValueError(f"Unknown EMBED_BACKEND '{cfg.embed_backend}' (use fastembed or openai)")
+
+    def encode(self, texts: list[str], batch_size: int = 256, progress: bool = False) -> np.ndarray:
+        if self.cfg.embed_backend == "fastembed":
+            it = self._model.embed(texts, batch_size=batch_size)
+            vecs = list(tqdm(it, total=len(texts), desc="Embedding entities", unit="ent") if progress else it)
+        else:
+            vecs = []
+            batches = range(0, len(texts), batch_size)
+            for i in (tqdm(batches, desc="Embedding entities", unit="batch") if progress else batches):
+                resp = self._client.embeddings.create(model=self.cfg.embed_model, input=texts[i:i + batch_size])
+                vecs.extend(d.embedding for d in resp.data)
+        arr = np.asarray(vecs, dtype="float32").reshape(len(texts), -1)
+        faiss.normalize_L2(arr)
+        return arr
+
+
+@dataclass
+class Candidate:
+    key: str
+    label: str
+    score: float
+    method: str  # "exact" | "dense"
+
+    def to_dict(self) -> dict:
+        return {"label": self.label, "term": self.key, "score": round(self.score, 4), "method": self.method}
+
+
+class EntityLinker:
+    """Bi-encoder linker: one vector per distinct label, exact inner-product (cosine) search with FAISS.
+
+    Like BLINK, retrieval is two-stage: the bi-encoder returns a wide shortlist (RERANK_POOL x top-k) and a cheap
+    second stage re-scores it. BLINK uses a cross-encoder there; we blend in character-level similarity instead,
+    which costs microseconds and fixes nicknames/typos that name embeddings handle poorly ("chris nolan").
+    """
+
+    RERANK_POOL = 4
+
+    def __init__(self, graph: KBGraph, embedder: Embedder, cfg: Config):
         t0 = time.perf_counter()
-        q = "SELECT DISTINCT ?e WHERE { { ?e ?p ?o } UNION { ?s ?p ?e } FILTER(isIRI(?e)) }"
-        names = []
-        for sol in store.query(q):
-            term = sol[0]
-            if isinstance(term, ox.NamedNode) and term.value.startswith(EX_PREFIX):
-                local = term.value[len(EX_PREFIX):]
-                if local not in predicate_set:
-                    names.append(local)
-        self.names = names
+        self.graph, self.embedder, self.cfg = graph, embedder, cfg
+        by_label: dict[str, list[str]] = {}
+        for key in graph.nodes:
+            by_label.setdefault(normalize_label(graph.labels[key]), []).append(key)
+        by_label.pop("", None)
+        self.label_texts = list(by_label)
+        self.label_terms = [by_label[t] for t in self.label_texts]
+        self.exact = {t: i for i, t in enumerate(self.label_texts)}
+        vectors = self._load_or_embed()
+        self.index = faiss.IndexFlatIP(vectors.shape[1])
+        self.index.add(vectors)
         self.build_seconds = time.perf_counter() - t0
 
-    def closest(self, name: str) -> tuple[str, float] | None:
-        if not self.names:
-            return None
-        if _rf_process is not None:
-            hit = _rf_process.extractOne(name, self.names, scorer=_rf_fuzz.ratio,
-                                         score_cutoff=self.cutoff * 100)
-            return (hit[0], hit[1] / 100) if hit else None
-        first = difflib.get_close_matches(name, self.names, n=1, cutoff=self.cutoff)
-        return (first[0], difflib.SequenceMatcher(None, name, first[0]).ratio()) if first else None
+    def _load_or_embed(self) -> np.ndarray:
+        digest = hashlib.sha1("\n".join([self.graph.signature, self.embedder.name, *self.label_texts])
+                              .encode("utf-8")).hexdigest()[:16]
+        self.cfg.cache_dir.mkdir(parents=True, exist_ok=True)
+        path = self.cfg.cache_dir / f"entity_vectors_{digest}.npy"
+        if path.exists():
+            vecs = np.load(path)
+            if vecs.shape[0] == len(self.label_texts):
+                print(f"Loaded cached entity embeddings ({vecs.shape[0]} labels) from {path}.")
+                return vecs
+        print(f"Embedding {len(self.label_texts)} entity labels with {self.embedder.name} (one-time, cached) ...")
+        vecs = self.embedder.encode(self.label_texts, progress=True)
+        np.save(path, vecs)
+        return vecs
+
+    def link_many(self, mentions: list[str]) -> dict[str, list[Candidate]]:
+        mentions = list(dict.fromkeys(m for m in mentions if m.strip()))
+        if not mentions:
+            return {}
+        k = max(1, self.cfg.link_top_k)
+        normed = [normalize_label(m) for m in mentions]
+        scores, ids = self.index.search(self.embedder.encode(normed), k * self.RERANK_POOL)
+        out: dict[str, list[Candidate]] = {}
+        for mention, norm_m, row_s, row_i in zip(mentions, normed, scores, ids):
+            cands: list[Candidate] = []
+            exact_id = self.exact.get(norm_m)
+            if exact_id is not None:
+                cands += [Candidate(key, self.graph.labels[key], 1.0, "exact") for key in self.label_terms[exact_id]]
+            dense = []
+            for score, idx in zip(row_s, row_i):
+                if idx < 0 or idx == exact_id or score < self.cfg.link_min_score:
+                    continue
+                lexical = difflib.SequenceMatcher(None, norm_m, self.label_texts[idx]).ratio()
+                dense.append((0.5 * float(score) + 0.5 * lexical, idx))
+            for score, idx in sorted(dense, reverse=True)[:k]:
+                cands += [Candidate(key, self.graph.labels[key], score, "dense") for key in self.label_terms[idx]]
+            out[mention] = cands
+        return out
 
 
-def resolve_entities(store: ox.Store, index: EntityIndex, predicate_set: set[str],
-                     sparql: str) -> tuple[str, list[dict]]:
-    """Verify every ex:<entity> in the SPARQL; fix case; fuzzy-repair near misses."""
-    infos: list[dict] = []
-    cache: dict[str, dict] = {}
+# --------------------------------------------------------------------------- #
+# RoG-style planner: one LLM call -> relation-path blueprint
+# --------------------------------------------------------------------------- #
 
-    def repl(m: re.Match) -> str:
-        raw, trail = m.group(1), ""
-        while raw.endswith("."):
-            raw, trail = raw[:-1], trail + "."
-        if raw in predicate_set:
-            return m.group(0)
-        if raw not in cache:
-            info = {"llm": raw}
-            if entity_exists(store, raw):
-                info.update(status="ok", resolved=raw)
-            elif entity_exists(store, entity_to_uri_local_name(raw)):
-                info.update(status="case_fixed", resolved=entity_to_uri_local_name(raw))
+def _nice(label: str) -> bool:
+    return 3 <= len(label) <= 40 and sum(ch.isalpha() for ch in label) >= 3
+
+
+def _pick_sample(graph: KBGraph, rel: Relation) -> tuple[str, str] | None:
+    for s, o in rel.samples:
+        if _nice(graph.label(s)) and _nice(graph.label(o)):
+            return s, o
+    return rel.samples[0] if rel.samples else None
+
+
+def build_schema_text(graph: KBGraph) -> str:
+    lines = []
+    for rel in sorted(graph.relations.values(), key=lambda r: -r.count):
+        ex = [f'"{graph.label(s)}" -> "{graph.label(o)}"' for s, o in rel.samples[:25]
+              if _nice(graph.label(s))][:2]
+        lines.append(f"- {rel.name}: subject -> {rel.object_kind}; {rel.count} facts"
+                     + (f"; e.g. {'; '.join(ex)}" if ex else ""))
+    return "\n".join(lines) or "(no relations discovered)"
+
+
+def _plan_json(*constraints: tuple[str, list[str]]) -> str:
+    return json.dumps({"plans": [{"constraints": [{"entity": e, "path": p} for e, p in constraints]}]},
+                      ensure_ascii=False)
+
+
+def build_plan_examples(store: ox.Store, graph: KBGraph) -> list[str]:
+    """Few-shot examples generated from real triples, with deliberately generic phrasing."""
+    entity_rels = [r for r in sorted(graph.relations.values(), key=lambda r: -r.count) if r.samples]
+    examples: list[str] = []
+    if not entity_rels:
+        return examples
+    r1 = entity_rels[0]
+    pick = _pick_sample(graph, r1)
+    if pick:
+        s, o = pick
+        examples.append(f'Q: "what is the {humanize(r1.name)} of {graph.label(s)}"\n'
+                        + _plan_json((graph.label(s), [r1.name])))
+    r2 = next((r for r in entity_rels[1:] if r.object_kind == "entity"), r1)
+    pick = _pick_sample(graph, r2)
+    if pick:
+        s, o = pick
+        examples.append(f'Q: "which things have {humanize(r2.name)} {graph.label(o)}"\n'
+                        + _plan_json((graph.label(o), [f"~{r2.name}"])))
+        # 2-hop: from o back to its subjects, then along another relation of such a subject.
+        try:
+            rows = list(store.query(f"SELECT DISTINCT ?p WHERE {{ {s} ?p ?x }}"))
+        except Exception:
+            rows = []
+        other = [graph.by_iri[t[0].value] for t in rows if t[0].value in graph.by_iri
+                 and graph.by_iri[t[0].value].name != r2.name]
+        if other:
+            r3 = max(other, key=lambda r: r.count)
+            examples.append(f'Q: "what is the {humanize(r3.name)} of the things whose {humanize(r2.name)} is '
+                            f'{graph.label(o)}"\n' + _plan_json((graph.label(o), [f"~{r2.name}", r3.name])))
+            o3 = next((t[0] for t in store.query(f"SELECT ?x WHERE {{ {s} <{r3.iri}> ?x }} LIMIT 1")), None)
+            if o3 is not None:
+                l3 = graph.label(term_key(o3))
+                examples.append(f'Q: "which things have {humanize(r2.name)} {graph.label(o)} and '
+                                f'{humanize(r3.name)} {l3}"\n'
+                                + _plan_json((graph.label(o), [f"~{r2.name}"]), (l3, [f"~{r3.name}"])))
+    return examples
+
+
+def build_plan_system_prompt(store: ox.Store, graph: KBGraph, cfg: Config) -> str:
+    examples = "\n\n".join(build_plan_examples(store, graph)) or "(no examples available)"
+    return f"""You are a query planner for a knowledge graph. You do NOT answer the question and you do NOT write SPARQL.
+You output a relation-path plan that a database engine will execute.
+
+Relations (subject -> object):
+{build_schema_text(graph)}
+
+Output ONE JSON object and nothing else:
+{{"plans": [{{"constraints": [{{"entity": "<topic entity>", "path": ["<rel>", "~<rel>", ...]}}]}}]}}
+
+Rules:
+1. "entity" is the named entity / value the question starts from, copied EXACTLY as written in the question.
+2. "path" is the sequence of relations walked from that entity to the answer (1 to {cfg.max_hops} steps).
+   "rel" walks subject -> object; "~rel" walks backwards object -> subject. Use ONLY the relation names above.
+   Paraphrases count: map the question's wording to the closest relation by meaning, and check the direction
+   against the examples in the relation list.
+3. Several constraints in one plan are INTERSECTED (use this when the answer must satisfy several conditions).
+4. Give 1 to {cfg.max_plans} alternative plans, most likely first. A later plan is only used if earlier ones find nothing.
+5. Counting/formatting is done later: plan for the set of answer entities.
+
+Examples:
+{examples}"""
+
+
+@dataclass
+class Constraint:
+    entity: str
+    path: list[str]  # short names, "~" prefix = inverse
+
+
+@dataclass
+class Plan:
+    constraints: list[Constraint]
+
+    def to_dict(self) -> dict:
+        return {"constraints": [{"entity": c.entity, "path": c.path} for c in self.constraints]}
+
+
+def extract_json(text: str) -> dict | None:
+    text = re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.IGNORECASE)
+    start = text.find("{")
+    while start != -1:
+        depth, in_str, esc = 0, False, False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_str:
+                esc = (ch == "\\") and not esc
+                if ch == '"' and not esc:
+                    in_str = False
+                elif ch != "\\":
+                    esc = False
+                continue
+            if ch == '"':
+                in_str = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:i + 1])
+                    except json.JSONDecodeError:
+                        break
+        start = text.find("{", start + 1)
+    return None
+
+
+def resolve_relation(graph: KBGraph, step: str) -> str | None:
+    """Map an LLM-written step onto a known relation, keeping its direction. Returns '~name' / 'name'."""
+    step = step.strip()
+    inverse = step[:1] in ("~", "^", "-")
+    name = step.lstrip("~^-").strip()
+    if name.endswith(("_inverse", "_inv", "_reverse")) and name not in graph.relations:
+        inverse, name = not inverse, re.sub(r"_(inverse|inv|reverse)$", "", name)
+    if name.startswith("<") and name.endswith(">"):
+        name = graph.by_iri[name[1:-1]].name if name[1:-1] in graph.by_iri else name
+    if name not in graph.relations:
+        if ":" in name and name.split(":", 1)[1] in graph.relations:
+            name = name.split(":", 1)[1]
+        else:
+            lowered = {r.lower(): r for r in graph.relations}
+            if name.lower() in lowered:
+                name = lowered[name.lower()]
             else:
-                near = index.closest(entity_to_uri_local_name(raw))
-                if near:
-                    info.update(status="repaired", resolved=near[0], score=round(near[1], 3))
-                else:
-                    info.update(status="not_found", resolved=raw)
-            cache[raw] = info
-            infos.append(info)
-        return "ex:" + cache[raw]["resolved"] + trail
+                close = difflib.get_close_matches(name, list(graph.relations), n=1, cutoff=0.8)
+                if not close:
+                    return None
+                name = close[0]
+    return ("~" if inverse else "") + name
 
-    return EX_REF.sub(repl, sparql), infos
+
+def parse_plans(graph: KBGraph, text: str, cfg: Config) -> tuple[list[Plan], list[str]]:
+    data, problems = extract_json(text), []
+    if data is None:
+        return [], ["output was not valid JSON"]
+    raw_plans = data.get("plans") if isinstance(data, dict) else None
+    if isinstance(data, dict) and raw_plans is None and "constraints" in data:
+        raw_plans = [data]
+    plans: list[Plan] = []
+    for rp in raw_plans or []:
+        constraints = []
+        for rc in (rp.get("constraints", []) if isinstance(rp, dict) else []):
+            if not isinstance(rc, dict) or not str(rc.get("entity", "")).strip():
+                continue
+            steps = rc.get("path") or []
+            steps = [steps] if isinstance(steps, str) else steps
+            resolved = [resolve_relation(graph, str(s)) for s in steps]
+            bad = [s for s, r in zip(steps, resolved) if r is None]
+            if bad:
+                problems.append(f"unknown relation(s) {bad}")
+                continue
+            if 0 < len(resolved) <= cfg.max_hops:
+                constraints.append(Constraint(str(rc["entity"]).strip(), resolved))
+        if constraints:
+            plans.append(Plan(constraints))
+    if not plans and not problems:
+        problems.append("no usable plan in output")
+    return plans[:cfg.max_plans], problems
+
+
+# --------------------------------------------------------------------------- #
+# Deterministic path execution
+# --------------------------------------------------------------------------- #
+
+def path_expr(graph: KBGraph, path: list[str]) -> str:
+    parts = []
+    for step in path:
+        rel = graph.relations[step.lstrip("~")]
+        parts.append(("^" if step.startswith("~") else "") + f"<{rel.iri}>")
+    return "/".join(parts)
+
+
+def path_sparql(graph: KBGraph, topic_key: str, path: list[str]) -> str:
+    # A multi-hop walk that returns to its starting point is never the intended answer (e.g. co-stars).
+    no_self = " FILTER(?answer != ?topic)" if len(path) > 1 else ""
+    return f"SELECT DISTINCT ?answer WHERE {{ VALUES ?topic {{ {topic_key} }} ?topic {path_expr(graph, path)} ?answer{no_self} }}"
+
+
+def run_path(store: ox.Store, graph: KBGraph, topic_key: str, path: list[str]) -> list[str]:
+    return [term_key(sol[0]) for sol in store.query(path_sparql(graph, topic_key, path)) if sol[0] is not None]
+
+
+def break_point(store: ox.Store, graph: KBGraph, topic_key: str, path: list[str]) -> int:
+    """Index of the first step after which the path yields nothing (len(path) if it never breaks)."""
+    for i in range(1, len(path) + 1):
+        q = f"ASK {{ VALUES ?topic {{ {topic_key} }} ?topic {path_expr(graph, path[:i])} ?x }}"
+        if not store.query(q):
+            return i - 1
+    return len(path)
+
+
+def entity_relations(store: ox.Store, graph: KBGraph, key: str) -> list[str]:
+    q = f"SELECT DISTINCT ?p ?dir WHERE {{ {{ {key} ?p ?x BIND(0 AS ?dir) }} UNION {{ ?x ?p {key} BIND(1 AS ?dir) }} }}"
+    out = []
+    for sol in store.query(q):
+        rel = graph.by_iri.get(sol[0].value)
+        if rel:
+            out.append(("~" if sol[1].value == "1" else "") + rel.name)
+    return sorted(out)
+
+
+@dataclass
+class Attempt:
+    plan: Plan
+    answers: list[str]
+    constraints: list[dict]
+    sparql: list[str]
+
+
+def execute_plan(ctx: "Context", plan: Plan, links: dict[str, list[Candidate]], trace: Trace) -> Attempt:
+    """For every constraint, use the best-ranked candidate entity for which the path is non-empty."""
+    answer_sets: list[list[str]] = []
+    info, sparqls = [], []
+    with trace.timer("path_execution"):
+        for c in plan.constraints:
+            cands = links.get(c.entity, [])
+            entry = {"entity": c.entity, "path": c.path, "linked": None, "results": 0,
+                     "candidates_tried": 0}
+            found: list[str] = []
+            for cand in cands:
+                entry["candidates_tried"] += 1
+                found = run_path(ctx.store, ctx.graph, cand.key, c.path)
+                if found:
+                    entry["linked"] = cand.to_dict()
+                    sparqls.append(path_sparql(ctx.graph, cand.key, c.path))
+                    break
+            if not found and cands:
+                top = cands[0]
+                entry["linked"] = top.to_dict()
+                entry["break_after_step"] = break_point(ctx.store, ctx.graph, top.key, c.path)
+                entry["entity_relations"] = entity_relations(ctx.store, ctx.graph, top.key)
+                sparqls.append(path_sparql(ctx.graph, top.key, c.path))
+            entry["results"] = len(found)
+            info.append(entry)
+            answer_sets.append(found)
+            if not found:
+                break
+    if len(answer_sets) == len(plan.constraints) and all(answer_sets):
+        common = set(answer_sets[0]).intersection(*answer_sets[1:])
+        answers = [a for a in answer_sets[0] if a in common]
+    else:
+        answers = []
+    return Attempt(plan, answers, info, sparqls)
+
+
+def replan_feedback(attempts: list[Attempt], problems: list[str]) -> str:
+    lines = ["None of your plans returned any results. What happened:"]
+    lines += [f"- {p}" for p in problems]
+    for i, att in enumerate(attempts, 1):
+        for c in att.constraints:
+            if c["linked"] is None:
+                lines.append(f"- plan {i}: entity \"{c['entity']}\" was not found in the graph; "
+                             "copy the entity text exactly as it appears in the question.")
+            elif not c["results"]:
+                step = c.get("break_after_step", 0)
+                where = (f"no results after step {step + 1} ({c['path'][step]})"
+                         if step < len(c["path"]) else "no results")
+                lines.append(f"- plan {i}: \"{c['entity']}\" -> \"{c['linked']['label']}\", path {c['path']}: "
+                             f"{where}. Relations this entity actually has: {c.get('entity_relations')}")
+    lines.append("Propose different plans (other relations or directions). Output only the JSON object.")
+    return "\n".join(lines)
 
 
 # --------------------------------------------------------------------------- #
@@ -295,7 +782,7 @@ BRACKET_ENTITY = re.compile(r"\[(.*?)]")
 @dataclass
 class ParsedQuestion:
     question: str            # brackets stripped: what the LLM sees
-    gold_entity: str | None  # local name from brackets, if the dataset has them
+    gold_entity: str | None  # bracketed entity text, if the dataset has it
     ground_truth: list[str]
 
 
@@ -308,8 +795,7 @@ def parse_qa_line(line: str) -> ParsedQuestion | None:
     if len(parts) != 2 or not parts[0].strip():
         return None
     m = BRACKET_ENTITY.search(parts[0])
-    return ParsedQuestion(clean_question(parts[0]),
-                          entity_to_uri_local_name(m.group(1)) if m else None,
+    return ParsedQuestion(clean_question(parts[0]), m.group(1) if m else None,
                           [a.strip() for a in parts[1].split("|") if a.strip()])
 
 
@@ -322,205 +808,67 @@ def read_qa_file(path: Path) -> Iterable[ParsedQuestion]:
 
 
 # --------------------------------------------------------------------------- #
-# Dynamic schema & few-shot examples (no brackets)
+# Pipeline
 # --------------------------------------------------------------------------- #
-
-def readable(local_name: str) -> str:
-    return local_name.replace("_", " ")
-
-
-PREDICATE_QUESTION_TEMPLATES: dict[str, tuple[str, str]] = {
-    "directed_by": ("subject", "Who directed {entity}"),
-    "written_by": ("subject", "Who wrote {entity}"),
-    "starred_actors": ("object", "What movies did {entity} star in"),
-    "has_genre": ("subject", "What genre is {entity}"),
-    "has_tags": ("subject", "What are the tags for {entity}"),
-    "in_language": ("subject", "What language is {entity} in"),
-    "release_year": ("subject", "What year was {entity} released"),
-    "has_imdb_rating": ("subject", "What is the IMDB rating of {entity}"),
-    "has_imdb_votes": ("subject", "How many IMDB votes does {entity} have"),
-}
-
-
-def _fallback_template(predicate_local: str) -> tuple[str, str]:
-    return "subject", f"What is the {predicate_local.replace('_', ' ')} of {{entity}}"
-
-
-@dataclass
-class SchemaExample:
-    predicate: str
-    direction: str
-    entity_local: str
-    answer_local: str
-    question: str
-    sparql: str
-
-
-@dataclass
-class KBSchema:
-    predicates: list[str]
-    examples: list[SchemaExample]
-
-
-def discover_predicates(store: ox.Store) -> list[str]:
-    preds = set()
-    for sol in store.query("SELECT DISTINCT ?p WHERE { ?s ?p ?o }"):
-        term = sol[0]
-        if isinstance(term, ox.NamedNode) and term.value.startswith(EX_PREFIX):
-            preds.add(term.value[len(EX_PREFIX):])
-    return sorted(preds)
-
-
-def sample_triple(store: ox.Store, predicate_local: str) -> tuple[str, str] | None:
-    try:
-        results = store.query(f"{SPARQL_PREFIX_HEADER}SELECT ?s ?o WHERE {{ ?s ex:{predicate_local} ?o }} LIMIT 1")
-    except Exception:
-        return None
-    for sol in results:
-        s_term, o_term = sol[0], sol[1]
-        if not isinstance(s_term, ox.NamedNode) or not s_term.value.startswith(EX_PREFIX):
-            continue
-        if isinstance(o_term, ox.NamedNode) and o_term.value.startswith(EX_PREFIX):
-            obj = o_term.value[len(EX_PREFIX):]
-        else:
-            obj = getattr(o_term, "value", str(o_term))
-        return s_term.value[len(EX_PREFIX):], obj
-    return None
-
-
-def build_schema_examples(store: ox.Store, predicates: list[str]) -> list[SchemaExample]:
-    examples = []
-    for predicate in predicates:
-        sample = sample_triple(store, predicate)
-        if sample is None:
-            continue
-        subject_local, object_text = sample
-        direction, template = PREDICATE_QUESTION_TEMPLATES.get(predicate, _fallback_template(predicate))
-        if direction == "subject":
-            entity_local, answer_local = subject_local, object_text
-            sparql = f"{SPARQL_PREFIX_HEADER}SELECT ?answer WHERE {{ ex:{entity_local} ex:{predicate} ?answer }}"
-        else:
-            entity_local, answer_local = entity_to_uri_local_name(object_text), subject_local
-            sparql = f"{SPARQL_PREFIX_HEADER}SELECT ?answer WHERE {{ ?answer ex:{predicate} ex:{entity_local} }}"
-        examples.append(SchemaExample(predicate, direction, entity_local, answer_local,
-                                      template.format(entity=readable(entity_local)), sparql))
-    return examples
-
-
-def get_or_build_schema(store: ox.Store, cfg: Config) -> KBSchema:
-    stat = cfg.kb_path.stat()
-    signature = f"v{SCHEMA_VERSION}:{stat.st_size}:{int(stat.st_mtime)}"
-    if cfg.schema_cache_path.exists():
-        try:
-            cached = json.loads(cfg.schema_cache_path.read_text(encoding="utf-8"))
-            if cached.get("kb_signature") == signature:
-                print(f"Loaded cached schema ({len(cached['predicates'])} predicates).")
-                return KBSchema(cached["predicates"], [SchemaExample(**e) for e in cached["examples"]])
-        except Exception:
-            pass
-    print("Discovering KB schema...")
-    local = discover_predicates(store)
-    schema = KBSchema([f"ex:{p}" for p in local], build_schema_examples(store, local))
-    cfg.schema_cache_path.write_text(json.dumps(
-        {"kb_signature": signature, "predicates": schema.predicates,
-         "examples": [vars(e) for e in schema.examples]}, indent=2, ensure_ascii=False), encoding="utf-8")
-    return schema
-
-
-# --------------------------------------------------------------------------- #
-# Prompts
-# --------------------------------------------------------------------------- #
-
-def build_system_prompt(schema: KBSchema) -> str:
-    predicates_block = "\n".join(schema.predicates) or "(none discovered)"
-    blocks = [f'Q: "{ex.question}"\n{ex.sparql}' for ex in schema.examples]
-    genre = next((e for e in schema.examples if e.predicate == "has_genre"), None)
-    if genre:
-        g = readable(genre.answer_local)
-        blocks.append(
-            f'Q: "how many {g} genre movies in 2000"\n{SPARQL_PREFIX_HEADER}'
-            f"SELECT ?answer WHERE {{ ?answer ex:has_genre ex:{genre.answer_local} . ?answer ex:release_year 2000 }}")
-    examples_text = "\n\n".join(blocks) or "(no examples available)"
-    return f"""You are a deterministic natural-language-to-SPARQL translator for a knowledge graph.
-PREFIX ex: <http://example.org/>
-
-Valid predicates:
-{predicates_block}
-
-Rules:
-1. Find the named entity in the question (movie title, person, genre, language, year, tag).
-2. Write it as ex:<local_name>, where local_name is the entity text EXACTLY as written in the question,
-   lowercased, with spaces replaced by underscores (e.g. "Christopher Nolan" -> ex:christopher_nolan).
-   Never abbreviate, shorten, translate or guess nicknames.
-3. Use ONLY the predicates listed above. The answer variable must be ?answer.
-4. Output exactly ONE raw SPARQL SELECT query. No markdown, no explanation.
-
-Examples:
-{examples_text}"""
-
 
 def build_answer_system_prompt() -> str:
     return ('You are a strictly grounded answer-formatting assistant. Only use the "Raw results" given.\n'
             'If count is asked, use the exact "Result count". Do not invent facts.')
 
 
-def strip_markdown_fences(text: str) -> str:
-    text = re.sub(r"^```(?:sparql|turtle)?\s*", "", text.strip(), flags=re.IGNORECASE)
-    return re.sub(r"```\s*$", "", text).strip()
-
-
-# --------------------------------------------------------------------------- #
-# Pipeline
-# --------------------------------------------------------------------------- #
-
 @dataclass
 class Context:
     cfg: Config
     store: ox.Store
     client: OpenAI
-    predicate_set: set[str]
-    entity_index: EntityIndex
-    sparql_prompt: str
+    graph: KBGraph
+    linker: EntityLinker
+    plan_prompt: str
     answer_prompt: str
 
 
-def local_name_from_term(term) -> str:
-    if isinstance(term, ox.NamedNode):
-        v = term.value
-        return v[len(EX_PREFIX):].replace("_", " ") if v.startswith(EX_PREFIX) else v
-    return term.value if isinstance(term, ox.Literal) else str(term)
-
-
-def execute_sparql(store: ox.Store, sparql: str) -> list[str]:
-    results = store.query(sparql)
-    variables = getattr(results, "variables", None)
-    answers = []
-    for sol in results:
-        terms = (sol[v] for v in variables) if variables else iter(sol)
-        answers.extend(local_name_from_term(t) for t in terms if t is not None)
-    return answers
-
-
 def process_question(ctx: Context, question: str, trace: Trace, with_nl: bool = False) -> dict:
-    """Runs all stages. Fills `trace` progressively so partial timings survive exceptions."""
-    out: dict = {}
+    """Plan (1 LLM call) -> link -> execute; replan only if everything came back empty."""
+    out: dict = {"llm_calls": 0, "replanned": False}
     question = clean_question(question)
+    messages = [{"role": "system", "content": ctx.plan_prompt}, {"role": "user", "content": f'Q: "{question}"'}]
+    attempts: list[Attempt] = []
+    out["plan_rounds"] = []
 
-    call = chat(ctx.client, ctx.cfg,
-                [{"role": "system", "content": ctx.sparql_prompt},
-                 {"role": "user", "content": f'Q: "{question}"'}], temperature=0.0)
-    trace.add_llm("sparql_generation", call)
-    sparql = strip_markdown_fences(call.text)
-    if "PREFIX ex:" not in sparql:
-        sparql = SPARQL_PREFIX_HEADER + sparql
-    out["raw_llm_response"], out["sparql_original"] = call.text, sparql
+    for round_no in range(ctx.cfg.replan_rounds + 1):
+        stage = "planning" if round_no == 0 else "replanning"
+        call = chat(ctx.client, ctx.cfg, messages, temperature=0.0)
+        trace.add_llm(stage, call)
+        out["llm_calls"] += 1
+        plans, problems = parse_plans(ctx.graph, call.text, ctx.cfg)
+        round_info = {"raw_llm_response": call.text, "plans": [p.to_dict() for p in plans], "problems": problems}
+        out["plan_rounds"].append(round_info)
 
-    with trace.timer("entity_resolution"):
-        sparql, entities = resolve_entities(ctx.store, ctx.entity_index, ctx.predicate_set, sparql)
-    out["sparql"], out["entities"] = sparql, entities
+        with trace.timer("entity_linking"):
+            links = ctx.linker.link_many([c.entity for p in plans for c in p.constraints])
+        round_info["links"] = {m: [c.to_dict() for c in cands] for m, cands in links.items()}
 
-    with trace.timer("db_execution"):
-        out["predicted"] = execute_sparql(ctx.store, sparql)
+        round_attempts = []
+        for plan in plans:
+            att = execute_plan(ctx, plan, links, trace)
+            round_attempts.append(att)
+            if att.answers:
+                break
+        attempts.extend(round_attempts)
+        winner = next((a for a in round_attempts if a.answers), None)
+        if winner or round_no == ctx.cfg.replan_rounds:
+            break
+        out["replanned"] = True
+        messages += [{"role": "assistant", "content": call.text},
+                     {"role": "user", "content": replan_feedback(round_attempts, problems)}]
+
+    best = next((a for a in attempts if a.answers), attempts[-1] if attempts else None)
+    out["attempts"] = [{"plan": a.plan.to_dict(), "constraints": a.constraints, "answers": len(a.answers)}
+                       for a in attempts]
+    out["plan_used"] = best.plan.to_dict() if best else None
+    out["entities"] = best.constraints if best else []
+    out["sparql"] = "\n".join(best.sparql) if best else ""
+    out["predicted"] = [ctx.graph.label(k) for k in best.answers] if best else []
 
     if with_nl:
         results = out["predicted"]
@@ -529,6 +877,7 @@ def process_question(ctx: Context, question: str, trace: Trace, with_nl: bool = 
         nl = chat(ctx.client, ctx.cfg, [{"role": "system", "content": ctx.answer_prompt},
                                         {"role": "user", "content": user}], temperature=0.2)
         trace.add_llm("nl_generation", nl)
+        out["llm_calls"] += 1
         out["nl_answer"] = nl.text.strip()
     return out
 
@@ -552,7 +901,7 @@ class RunRecorder:
         self.qlog = (run_dir / "queries.log").open("w", encoding="utf-8")
         self.errlog = (run_dir / "errors.log").open("w", encoding="utf-8")
         self.csv_fh = (run_dir / "timings.csv").open("w", newline="", encoding="utf-8")
-        cols = ["index", "status", "total_s", "total_cost_usd"]
+        cols = ["index", "status", "llm_calls", "total_s", "total_cost_usd"]
         for st in STAGES:
             cols += [f"{st}_s", f"{st}_prompt_tok", f"{st}_completion_tok"]
         self.csv = csv.writer(self.csv_fh)
@@ -563,23 +912,30 @@ class RunRecorder:
         detail["metrics"] = m
         self.jsonl.write(json.dumps(detail, ensure_ascii=False) + "\n")
         self.jsonl.flush()
-        row = [detail.get("index"), detail.get("status"), m["total_seconds"], m["total_cost_usd"]]
+        row = [detail.get("index"), detail.get("status"), detail.get("llm_calls", 0),
+               m["total_seconds"], m["total_cost_usd"]]
         for st in STAGES:
             s = m["stages"].get(st, {})
             row += [s.get("seconds", 0), s.get("prompt_tokens", 0), s.get("completion_tokens", 0)]
         self.csv.writerow(row)
         self.csv_fh.flush()
+        linked = [f"{e['entity']} -> {e['linked']['label'] if e.get('linked') else None} "
+                  f"({e['linked']['method'] if e.get('linked') else 'unlinked'})"
+                  for e in detail.get("entities") or []]
         self.qlog.write(f"[{detail.get('index')}] Q: {detail.get('question')}\n"
-                        f"  status   : {detail.get('status')}\n"
-                        f"  entities : {detail.get('entities')}\n"
-                        f"  SPARQL   : {detail.get('sparql', '').replace(chr(10), ' ')}\n"
+                        f"  status   : {detail.get('status')}  (llm calls: {detail.get('llm_calls', 0)}"
+                        f"{', replanned' if detail.get('replanned') else ''})\n"
+                        f"  plan     : {json.dumps(detail.get('plan_used'), ensure_ascii=False)}\n"
+                        f"  linked   : {linked}\n"
+                        f"  SPARQL   : {detail.get('sparql', '').replace(chr(10), ' || ')}\n"
                         f"  predicted: {str(detail.get('predicted'))[:300]}\n"
                         f"  truth    : {detail.get('ground_truth')}\n"
                         f"  time     : {m['total_seconds']:.3f}s  " +
                         " ".join(f"{k}={v['seconds']:.3f}s" for k, v in m["stages"].items()) + "\n\n")
         self.qlog.flush()
         self.records.append({"index": detail.get("index"), "question": detail.get("question"),
-                             "status": detail.get("status"), "metrics": m})
+                             "status": detail.get("status"), "llm_calls": detail.get("llm_calls", 0),
+                             "replanned": detail.get("replanned", False), "metrics": m})
 
     def error(self, question: str, exc: BaseException) -> None:
         self.errlog.write(f"Q: {question}\n{''.join(traceback.format_exception(exc))}\n{'-' * 60}\n")
@@ -624,6 +980,8 @@ def summarize(records: list[dict], extra: dict) -> dict:
         "mean_seconds_per_question": round(sum(totals) / n, 4) if n else 0,
         "p50_s": round(_pct(totals, 50), 4), "p95_s": round(_pct(totals, 95), 4),
         "total_cost_usd": round(sum(r["metrics"]["total_cost_usd"] for r in records), 6),
+        "mean_llm_calls_per_question": round(sum(r["llm_calls"] for r in records) / n, 3) if n else 0,
+        "replanned_questions": sum(r["replanned"] for r in records),
         "stages": stages, "slowest_questions": slowest, **extra}
     summary["diagnosis"] = diagnose(summary)
     return summary
@@ -637,38 +995,38 @@ def diagnose(s: dict) -> list[str]:
     top = max(st, key=lambda k: st[k]["total_s"])
     tips.append(f"Bottleneck: '{top}' = {st[top]['share_of_time']:.0%} of total time "
                 f"(mean {st[top]['mean_s']}s, p95 {st[top]['p95_s']}s).")
-    g = st.get("sparql_generation")
+    g = st.get("planning")
     if g:
         n = max(g["calls"], 1)
         avg_in, avg_out = g["prompt_tokens"] / n, g["completion_tokens"] / n
         if avg_in > 2000:
-            tips.append(f"SPARQL prompt averages {avg_in:.0f} tokens/call. Large prompt = slow prompt-eval. "
-                        "Shrink the predicate list / few-shot examples (see prompt_sparql.txt), or enable prompt caching.")
-        if avg_out > 120:
-            tips.append(f"SPARQL output averages {avg_out:.0f} tokens but a query needs ~40-80. The model is likely "
-                        "emitting reasoning/explanations. Check raw_llm_response in details.jsonl, set LLM_MAX_TOKENS, "
+            tips.append(f"Planning prompt averages {avg_in:.0f} tokens/call: the relation list is large. "
+                        "The system prompt is identical for every question, so enable prompt caching on the server.")
+        if avg_out > 150:
+            tips.append(f"Planning output averages {avg_out:.0f} tokens but a plan needs ~30-80. The model is likely "
+                        "emitting reasoning. Check raw_llm_response in details.jsonl, set LLM_MAX_TOKENS, "
                         "or use a non-thinking model.")
         if g.get("completion_tok_per_s") and g["completion_tok_per_s"] < 15:
             tips.append(f"Generation speed is only {g['completion_tok_per_s']} tok/s: model/hardware bound "
                         "(try a smaller/quantized model or GPU offload).")
-        if g["p95_s"] > 3 * max(g["p50_s"], 1e-6):
-            tips.append("sparql_generation has high variance (p95 > 3x p50): see slowest_questions for outliers.")
-    e = st.get("entity_resolution")
+    if s.get("questions") and s.get("replanned_questions", 0) / s["questions"] > 0.2:
+        tips.append(f"{s['replanned_questions']} questions needed a 2nd LLM call (replanning): first plans often "
+                    "come back empty. Look at 'attempts' in details.jsonl for wrong relation directions.")
+    e = st.get("entity_linking")
     if e and e["share_of_time"] > 0.10:
-        tips.append("entity_resolution is >10% of time: fuzzy matching is slow. `pip install rapidfuzz`.")
-    d = st.get("db_execution")
+        tips.append("entity_linking is >10% of time: use a smaller EMBED_MODEL or the fastembed backend.")
+    d = st.get("path_execution")
     if d and d["share_of_time"] > 0.10:
-        tips.append("db_execution is >10% of time: inspect slow queries (unbounded patterns/missing predicates).")
+        tips.append("path_execution is >10% of time: plans fan out widely (inspect long paths / huge answer sets).")
     ent = s.get("entity_stats")
     if ent and ent.get("questions_with_entities"):
         q = ent["questions_with_entities"]
-        fixed = (ent["repaired"] + ent["case_fixed"]) / q
-        if fixed > 0.10:
-            tips.append(f"{fixed:.0%} of questions needed entity repair: the LLM misnames entities. "
-                        "Strengthen rule 2 in the prompt or add more name examples.")
-        if ent["not_found"]:
-            tips.append(f"{ent['not_found']} question(s) had an entity that could not be resolved "
-                        "(status 'entity_not_found'): likely empty results.")
+        if ent["dense"] / q > 0.10:
+            tips.append(f"{ent['dense'] / q:.0%} of questions were linked by vector search rather than exact label "
+                        "match: mentions differ from KB labels (check 'links' in details.jsonl).")
+        if ent["not_linked"]:
+            tips.append(f"{ent['not_linked']} question(s) had a mention with no candidate above LINK_MIN_SCORE="
+                        "(lower it or raise LINK_TOP_K).")
     if any(v.get("tokens_estimated") for v in st.values()):
         tips.append("Token counts are ESTIMATED (server returned no usage). Cost figures are approximate.")
     return tips
@@ -677,7 +1035,8 @@ def diagnose(s: dict) -> list[str]:
 def render_summary(s: dict) -> str:
     L = ["=" * 78, "RUN SUMMARY", "=" * 78,
          f"Questions: {s['questions']}  | total {s['total_seconds']}s | mean {s['mean_seconds_per_question']}s "
-         f"| p50 {s['p50_s']}s | p95 {s['p95_s']}s | cost ${s['total_cost_usd']}"]
+         f"| p50 {s['p50_s']}s | p95 {s['p95_s']}s | cost ${s['total_cost_usd']}",
+         f"LLM calls/question: {s['mean_llm_calls_per_question']} | replanned: {s['replanned_questions']}"]
     if "accuracy" in s:
         a = s["accuracy"]
         L.append(f"Accuracy (any-hit): {a['any_hit']:.2%} | exact-set: {a['exact']:.2%} | "
@@ -700,7 +1059,7 @@ def render_summary(s: dict) -> str:
 # --------------------------------------------------------------------------- #
 
 def norm(text: str) -> str:
-    return text.strip().lower()
+    return normalize_label(text)
 
 
 @dataclass
@@ -731,15 +1090,22 @@ def _prompt_continue(question: str, status: str) -> bool:
             return False
 
 
-def evaluate(ctx: Context, rec: RunRecorder, with_nl: bool, prompt_on_error: bool) -> tuple[EvalStats, dict]:
+def load_questions(cfg: Config) -> list[ParsedQuestion]:
+    qs = list(read_qa_file(cfg.qa_path))
+    return qs[:cfg.max_questions] if cfg.max_questions else qs
+
+
+def evaluate(ctx: Context, rec: RunRecorder, with_nl: bool, prompt_on_error: bool,
+             questions: list[ParsedQuestion] | None = None,
+             on_progress: Callable[[int, int, dict, EvalStats], bool | None] | None = None) -> tuple[EvalStats, dict]:
+    """Evaluate a QA set. `on_progress(done, total, detail, stats)` runs after every question;
+    returning False stops the run early (used by the web UI's stop button)."""
     stats = EvalStats()
-    ent = {"questions_with_entities": 0, "ok": 0, "case_fixed": 0, "repaired": 0, "not_found": 0}
-    qs = list(read_qa_file(ctx.cfg.qa_path))
-    if ctx.cfg.max_questions:
-        qs = qs[:ctx.cfg.max_questions]
+    ent = {"questions_with_entities": 0, "exact": 0, "dense": 0, "not_linked": 0}
+    qs = questions if questions is not None else load_questions(ctx.cfg)
     error_seen = False
 
-    for pq in tqdm(qs, desc="Evaluating", unit="q"):
+    for pq in (qs if on_progress else tqdm(qs, desc="Evaluating", unit="q")):
         stats.total += 1
         trace = Trace(ctx.cfg)
         detail = {"index": stats.total, "question": pq.question, "gold_entity": pq.gold_entity,
@@ -751,34 +1117,99 @@ def evaluate(ctx: Context, rec: RunRecorder, with_nl: bool, prompt_on_error: boo
             truth = {norm(t) for t in pq.ground_truth}
             hit = bool(pred & truth)
             infos = detail["entities"]
-            statuses = {i["status"] for i in infos}
+            methods = {i["linked"]["method"] if i.get("linked") else "not_linked" for i in infos}
             if infos:
                 ent["questions_with_entities"] += 1
-                for key in ("not_found", "repaired", "case_fixed"):
-                    if key in statuses:
-                        ent[key] += 1
-                if statuses == {"ok"}:
-                    ent["ok"] += 1
+                for key in ("exact", "dense", "not_linked"):
+                    ent[key] += key in methods
             if pq.gold_entity:
                 stats.gold_checked += 1
-                gold_hit = pq.gold_entity in {i["resolved"] for i in infos}
+                gold_hit = norm(pq.gold_entity) in {norm(i["linked"]["label"]) for i in infos if i.get("linked")}
                 detail["entity_matches_gold"] = gold_hit
                 stats.gold_match += gold_hit
             stats.correct += hit
             stats.exact += (pred == truth)
-            detail["status"] = "correct" if hit else ("entity_not_found" if "not_found" in statuses else "incorrect")
+            detail["status"] = "correct" if hit else ("entity_not_linked" if "not_linked" in methods
+                                                      else "incorrect")
         except Exception as exc:
             failed = True
             stats.errors += 1
             detail["status"] = f"error: {exc}"
             rec.error(pq.question, exc)
         rec.record(detail, trace)
+        if on_progress and on_progress(stats.total, len(qs), detail, stats) is False:
+            stats.aborted_early = True
+            break
         if failed and prompt_on_error and not error_seen:
             error_seen = True
             if not _prompt_continue(pq.question, detail["status"]):
                 stats.aborted_early = True
                 break
     return stats, ent
+
+
+def accuracy_dict(stats: EvalStats) -> dict:
+    return {"any_hit": stats.accuracy,
+            "exact": stats.exact / stats.total if stats.total else 0.0,
+            "errors": stats.errors,
+            "entity_gold_match": (f"{stats.gold_match / stats.gold_checked:.2%}" if stats.gold_checked else "n/a"),
+            "aborted_early": stats.aborted_early}
+
+
+# --------------------------------------------------------------------------- #
+# Setup shared by the CLI and the web UI (app.py)
+# --------------------------------------------------------------------------- #
+
+def build_context(cfg: Config, log: Callable[[str], None] = print) -> tuple[Context, dict[str, float]]:
+    """Load the KB, introspect its schema, build the entity index and the planning prompt."""
+    startup: dict[str, float] = {}
+    t0 = time.perf_counter()
+    store = build_store(cfg.kb_path)
+    startup["kb_load"] = round(time.perf_counter() - t0, 3)
+
+    t0 = time.perf_counter()
+    graph = introspect_kb(store, cfg.kb_path)
+    startup["schema"] = round(time.perf_counter() - t0, 3)
+    log(f"Schema: {len(graph.relations)} relations, {len(graph.nodes)} linkable nodes.")
+
+    t0 = time.perf_counter()
+    linker = EntityLinker(graph, Embedder(cfg), cfg)
+    startup["entity_index_build"] = round(time.perf_counter() - t0, 3)
+    log(f"Entity index: {linker.index.ntotal} label vectors ({linker.embedder.name}, FAISS flat IP).")
+
+    t0 = time.perf_counter()
+    plan_prompt = build_plan_system_prompt(store, graph, cfg)
+    startup["plan_prompt"] = round(time.perf_counter() - t0, 3)
+    ctx = Context(cfg, store, build_llm_client(cfg), graph, linker, plan_prompt, build_answer_system_prompt())
+    return ctx, startup
+
+
+def write_run_header(run_dir: Path, ctx: Context, startup: dict[str, float]) -> None:
+    cfg, graph, linker = ctx.cfg, ctx.graph, ctx.linker
+    (run_dir / "prompt_plan.txt").write_text(ctx.plan_prompt, encoding="utf-8")
+    (run_dir / "prompt_answer.txt").write_text(ctx.answer_prompt, encoding="utf-8")
+    cfg_dump = {k: str(v) for k, v in vars(cfg).items()}
+    cfg_dump["llm_api_key"] = cfg_dump["embed_api_key"] = "***redacted***"
+    (run_dir / "run_config.json").write_text(json.dumps({
+        "started_at": datetime.now().isoformat(timespec="seconds"), "argv": sys.argv,
+        "config": cfg_dump, "python": platform.python_version(),
+        "pyoxigraph": getattr(ox, "__version__", "unknown"), "faiss": getattr(faiss, "__version__", "unknown"),
+        "embedder": linker.embedder.name,
+        "plan_prompt_chars": len(ctx.plan_prompt),
+        "plan_prompt_est_tokens": estimate_tokens(ctx.plan_prompt),
+        "n_relations": len(graph.relations), "n_linkable_nodes": len(graph.nodes),
+        "n_label_vectors": linker.index.ntotal, "startup_timings_s": startup}, indent=2), encoding="utf-8")
+
+
+def finalize_run(rec: RunRecorder, extra: dict) -> dict | None:
+    """Close the recorder and write summary.json / summary.txt. Returns the summary (None if nothing ran)."""
+    rec.close()
+    if not rec.records:
+        return None
+    summary = summarize(rec.records, extra)
+    (rec.dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+    (rec.dir / "summary.txt").write_text(render_summary(summary), encoding="utf-8")
+    return summary
 
 
 # --------------------------------------------------------------------------- #
@@ -799,12 +1230,14 @@ def ask_adhoc(ctx: Context, rec: RunRecorder, question: str) -> None:
     try:
         detail.update(process_question(ctx, question, trace, with_nl=True))
         detail["status"] = "answered"
-        print(f"\nSPARQL:\n{detail['sparql']}")
-        repaired = [e for e in detail["entities"] if e["status"] in ("repaired", "case_fixed")]
-        if repaired:
-            print(f"Entity repaired: {repaired}")
-        if any(e["status"] == "not_found" for e in detail["entities"]):
-            print("WARNING: an entity was not found in the KB; results are likely empty.")
+        print(f"\nPlan: {json.dumps(detail['plan_used'], ensure_ascii=False)}")
+        for e in detail["entities"]:
+            linked = e.get("linked")
+            print(f"Linked: {e['entity']!r} -> "
+                  + (f"{linked['label']!r} ({linked['method']}, score {linked['score']})" if linked else "NOT FOUND"))
+        if detail["replanned"]:
+            print("(first plan returned nothing; replanned)")
+        print(f"SPARQL:\n{detail['sparql']}")
         print(f"Answer: {detail['nl_answer']}")
     except Exception as exc:
         detail["status"] = f"error: {exc}"
@@ -828,41 +1261,12 @@ def main() -> int:
     cfg = load_config()
     run_dir = create_run_output_dir()
     print(f"Run folder: {run_dir}")
-    startup: dict[str, float] = {}
-
-    t0 = time.perf_counter()
     try:
-        store = build_store(cfg.kb_path)
+        ctx, startup = build_context(cfg)
     except FileNotFoundError as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
-    startup["kb_load"] = round(time.perf_counter() - t0, 3)
-
-    t0 = time.perf_counter()
-    schema = get_or_build_schema(store, cfg)
-    startup["schema"] = round(time.perf_counter() - t0, 3)
-
-    predicate_set = {p[len("ex:"):] for p in schema.predicates}
-    index = EntityIndex(store, predicate_set, cfg.fuzzy_cutoff)
-    startup["entity_index_build"] = round(index.build_seconds, 3)
-    print(f"Entity index: {len(index.names)} entities ({'rapidfuzz' if _rf_process else 'difflib'} matcher).")
-
-    ctx = Context(cfg, store, build_llm_client(cfg), predicate_set, index,
-                  build_system_prompt(schema), build_answer_system_prompt())
-
-    (run_dir / "prompt_sparql.txt").write_text(ctx.sparql_prompt, encoding="utf-8")
-    (run_dir / "prompt_answer.txt").write_text(ctx.answer_prompt, encoding="utf-8")
-    cfg_dump = {k: str(v) for k, v in vars(cfg).items()}
-    cfg_dump["llm_api_key"] = "***redacted***"
-    (run_dir / "run_config.json").write_text(json.dumps({
-        "started_at": datetime.now().isoformat(timespec="seconds"), "argv": sys.argv,
-        "config": cfg_dump, "python": platform.python_version(),
-        "pyoxigraph": getattr(ox, "__version__", "unknown"),
-        "fuzzy_matcher": "rapidfuzz" if _rf_process else "difflib",
-        "sparql_prompt_chars": len(ctx.sparql_prompt),
-        "sparql_prompt_est_tokens": estimate_tokens(ctx.sparql_prompt),
-        "n_predicates": len(predicate_set), "n_entities": len(index.names),
-        "startup_timings_s": startup}, indent=2), encoding="utf-8")
+    write_run_header(run_dir, ctx, startup)
 
     rec = RunRecorder(run_dir)
     extra: dict = {"startup_timings": startup, "model": cfg.llm_model, "mode": "eval"}
@@ -884,21 +1288,12 @@ def main() -> int:
         else:
             stats, ent = evaluate(ctx, rec, args.with_nl, prompt_on_error=not args.yes)
             extra["entity_stats"] = ent
-            extra["accuracy"] = {
-                "any_hit": stats.accuracy,
-                "exact": stats.exact / stats.total if stats.total else 0.0,
-                "errors": stats.errors,
-                "entity_gold_match": (f"{stats.gold_match / stats.gold_checked:.2%}" if stats.gold_checked else "n/a"),
-                "aborted_early": stats.aborted_early}
+            extra["accuracy"] = accuracy_dict(stats)
             print(f"\nTotal: {stats.total} | Correct: {stats.correct} | Accuracy: {stats.accuracy:.2%}")
     finally:
-        rec.close()
-        if rec.records:
-            summary = summarize(rec.records, extra)
-            (run_dir / "summary.json").write_text(json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
-            text = render_summary(summary)
-            (run_dir / "summary.txt").write_text(text, encoding="utf-8")
-            print("\n" + text)
+        summary = finalize_run(rec, extra)
+        if summary:
+            print("\n" + render_summary(summary))
         print(f"\nAll artifacts saved to: {run_dir}")
     return 0
 

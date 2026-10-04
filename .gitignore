@@ -7,3 +7,4 @@ MetaQA/
 Backup/
 Kb.ttl
 schema_cache.json
+.cache/
