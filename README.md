@@ -1,5 +1,8 @@
 # GraphStrider
 
+> [!WARNING]
+> **This project is under active testing and development.** Interfaces, configuration and results may change.
+
 Ask natural-language questions over any RDF knowledge graph. One cheap LLM call plans the answer,
 and the database does the rest.
 
@@ -24,7 +27,40 @@ question ──► LLM planner (1 call) ──► {"entity": "Joel Zwick", "path
                                      answers: Greek
 ```
 
-See **[docs/IMPLEMENTATION.md](docs/IMPLEMENTATION.md)** for the full design.
+## Architecture
+
+```mermaid
+flowchart TD
+    subgraph Startup["Startup (once per KB)"]
+        KB[("RDF knowledge graph<br/>kb.ttl")] --> Store["Oxigraph store"]
+        Store --> Introspect["KB introspection<br/>relations · labels · namespaces"]
+        Introspect --> Prompt["Planning prompt<br/>schema + auto-generated few-shot examples"]
+        Introspect --> Embed["Embed entity labels<br/>(fastembed / OpenAI-compatible)"]
+        Embed --> FAISS[("FAISS index<br/>cached in .cache/")]
+    end
+
+    subgraph Query["Per question"]
+        Q(["Question"]) --> Planner["LLM planner (RoG)<br/>1 call → topic entities + relation paths"]
+        Prompt --> Planner
+        Planner --> Linker["Bi-encoder entity linker (BLINK)<br/>top-k nearest neighbours"]
+        FAISS --> Linker
+        Linker --> Exec["SPARQL property-path executor"]
+        Store --> Exec
+        Exec -->|answers found| Ans(["Answers"])
+        Exec -->|all plans empty| Replan["Replan with feedback<br/>(REPLAN_ROUNDS)"]
+        Replan --> Planner
+        Ans -.->|optional| NL["LLM natural-language answer"]
+    end
+
+    subgraph UI["Interfaces"]
+        CLI["main.py CLI<br/>question · REPL · evaluation"]
+        Web["app.py Streamlit<br/>Ask · Evaluate · Runs · KG"]
+    end
+
+    CLI --> Q
+    Web --> Q
+    Ans --> Out[("outputs/run_*/<br/>details · timings · summary")]
+```
 
 ## Quick start
 
@@ -112,4 +148,35 @@ kb.ttl                  knowledge graph (not committed)
 MetaQA/                 benchmark QA files (not committed)
 outputs/                run folders (not committed)
 .cache/                 entity-vector cache (not committed)
+```
+
+## References
+
+GraphStrider builds on the following work:
+
+- **RoG**: Linhao Luo, Yuan-Fang Li, Gholamreza Haffari and Shirui Pan. *Reasoning on Graphs: Faithful and
+  Interpretable Large Language Model Reasoning.* 2024. [arXiv:2310.01061](https://arxiv.org/abs/2310.01061)
+- **BLINK**: Ledell Wu, Fabio Petroni, Martin Josifoski, Sebastian Riedel and Luke Zettlemoyer. *Scalable
+  Zero-shot Entity Linking with Dense Entity Retrieval.* 2020. [arXiv:1911.03814](https://arxiv.org/abs/1911.03814)
+
+```bibtex
+@misc{luo2024reasoninggraphsfaithfulinterpretable,
+      title={Reasoning on Graphs: Faithful and Interpretable Large Language Model Reasoning},
+      author={Linhao Luo and Yuan-Fang Li and Gholamreza Haffari and Shirui Pan},
+      year={2024},
+      eprint={2310.01061},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/2310.01061},
+}
+
+@misc{wu2020scalablezeroshotentitylinking,
+      title={Scalable Zero-shot Entity Linking with Dense Entity Retrieval},
+      author={Ledell Wu and Fabio Petroni and Martin Josifoski and Sebastian Riedel and Luke Zettlemoyer},
+      year={2020},
+      eprint={1911.03814},
+      archivePrefix={arXiv},
+      primaryClass={cs.CL},
+      url={https://arxiv.org/abs/1911.03814},
+}
 ```
